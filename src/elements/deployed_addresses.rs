@@ -15,7 +15,7 @@ use alloy::{
     primitives::{Address, U256},
     providers::Provider,
     sol,
-    sol_types::{SolConstructor, SolValue},
+    sol_types::{SolCall, SolConstructor},
 };
 use serde::Deserialize;
 
@@ -34,10 +34,26 @@ sol! {
 
     #[sol(rpc)]
     contract ValidatorTimelock {
-        constructor(address _initialOwner, uint32 _executionDelay);
+        constructor(address _bridgehub);
         address public chainTypeManager;
         address public owner;
         uint32 public executionDelay;
+
+        function initialize(address _owner, uint32 _initialExecutionDelay) external;
+    }
+
+    #[sol(rpc)]
+    contract ChainAssetHandler {
+        constructor(
+            uint256 _l1ChainID,
+            address _owner,
+            address _bridgehub,
+            address _l1AssetRouter,
+            address _messageRoot
+        );
+        address public owner;
+
+        function initialize(address _owner) external;
     }
 
     #[sol(rpc)]
@@ -143,7 +159,7 @@ sol! {
     }
 
     contract MessageRoot {
-        constructor(address _bridgehub);
+        constructor(address _bridgehub, uint256 _l1ChainId);
         function initialize();
     }
 
@@ -223,10 +239,9 @@ const EXPECTED_GATEWAY_FACETS: [BasicFacetInfo; 4] = [
 #[derive(Debug, Deserialize)]
 pub struct DeployedAddresses {
     pub(crate) native_token_vault_implementation_addr: Address,
-
     pub(crate) validator_timelock_addr: Address,
+    pub(crate) validator_timelock_implementation_addr: Address,
     pub(crate) l1_bytecodes_supplier_addr: Address,
-    pub(crate) l1_transitionary_owner: Address,
     pub(crate) l1_rollup_da_manager: Address,
     pub(crate) rollup_l1_da_validator_addr: Address,
     #[allow(dead_code)]
@@ -236,19 +251,26 @@ pub struct DeployedAddresses {
     pub(crate) bridgehub: Bridgehub,
     pub(crate) state_transition: StateTransition,
     pub(crate) upgrade_stage_validator: Address,
+    pub(crate) protocol_upgrade_handler_address_implementation: Address,
 }
 
 #[derive(Debug, Deserialize)]
 pub struct Bridges {
     pub l1_asset_router_implementation_addr: Address,
     pub l1_nullifier_implementation_addr: Address,
+    pub erc20_bridge_proxy_addr: Address,
+    pub erc20_bridge_implementation_addr: Address,
 }
 
 #[derive(Debug, Deserialize)]
 pub struct Bridgehub {
-    bridgehub_implementation_addr: Address,
-    message_root_proxy_addr: Address,
-    message_root_implementation_addr: Address,
+    pub bridgehub_implementation_addr: Address,
+    pub message_root_proxy_addr: Address,
+    pub message_root_implementation_addr: Address,
+    pub ctm_deployment_tracker_proxy_addr: Address,
+    pub ctm_deployment_tracker_implementation_addr: Address,
+    pub chain_asset_handler_implementation_addr: Address,
+    pub chain_asset_handler_proxy_addr: Address,
     // Note, that while the original file may contain impl addresses,
     // we do not include or verify those here since the correctness of the
     // actual implementation behind the proxies above is already checked.
@@ -279,6 +301,10 @@ impl DeployedAddresses {
             "native_token_vault_implementation_addr",
         );
         address_verifier.add_address(self.validator_timelock_addr, "validator_timelock");
+        address_verifier.add_address(
+            self.validator_timelock_implementation_addr,
+            "validator_timelock_implementation_addr",
+        );
 
         address_verifier.add_address(
             self.bridges.l1_asset_router_implementation_addr,
@@ -295,8 +321,32 @@ impl DeployedAddresses {
             "bridgehub_implementation_addr",
         );
         address_verifier.add_address(
+            self.bridgehub.ctm_deployment_tracker_proxy_addr,
+            "ctm_deployment_tracker_proxy_addr",
+        );
+        address_verifier.add_address(
+            self.bridgehub.ctm_deployment_tracker_implementation_addr,
+            "ctm_deployment_tracker_implementation_addr",
+        );
+        address_verifier.add_address(
+            self.bridgehub.chain_asset_handler_implementation_addr,
+            "chain_asset_handler_implementation_addr",
+        );
+        address_verifier.add_address(
+            self.bridgehub.chain_asset_handler_proxy_addr,
+            "chain_asset_handler_proxy_addr",
+        );
+        address_verifier.add_address(
             self.bridges.l1_nullifier_implementation_addr,
             "l1_nullifier_implementation_addr",
+        );
+        address_verifier.add_address(
+            self.bridges.erc20_bridge_proxy_addr,
+            "erc20_bridge_proxy_addr",
+        );
+        address_verifier.add_address(
+            self.bridges.erc20_bridge_implementation_addr,
+            "erc20_bridge_implementation_addr",
         );
 
         address_verifier.add_address(self.l1_rollup_da_manager, "rollup_da_manager");
@@ -355,7 +405,7 @@ impl DeployedAddresses {
         result: &mut crate::verifiers::VerificationResult,
         bridgehub_info: &BridgehubInfo,
     ) -> Result<()> {
-        if self.validator_timelock_addr == Address::ZERO {
+        if self.validator_timelock_implementation_addr == Address::ZERO {
             result.report_warn("ValidatorTimelock address is zero");
             return Ok(());
         }
@@ -364,11 +414,12 @@ impl DeployedAddresses {
         } else {
             0
         };
+        let validator_timelock_constructor_params =
+            ValidatorTimelock::constructorCall::new((bridgehub_info.bridgehub_addr,)).abi_encode();
         result.expect_create2_params(
             verifiers,
-            &self.validator_timelock_addr,
-            ValidatorTimelock::constructorCall::new((config.deployer_addr, execution_delay))
-                .abi_encode(),
+            &self.validator_timelock_implementation_addr,
+            validator_timelock_constructor_params.clone(),
             "l1-contracts/ValidatorTimelock",
         );
 
@@ -376,9 +427,9 @@ impl DeployedAddresses {
         let validator_timelock = ValidatorTimelock::new(self.validator_timelock_addr, provider);
         let current_owner = validator_timelock.owner().call().await?.owner;
         ensure!(
-            current_owner == self.l1_transitionary_owner,
+            current_owner == config.owner_address,
             "ValidatorTimelock owner mismatch: expected {:?}, got {:?}",
-            self.l1_transitionary_owner,
+            config.owner_address,
             current_owner
         );
 
@@ -394,17 +445,74 @@ impl DeployedAddresses {
             current_execution_delay
         );
 
-        let chain_type_manager = validator_timelock
-            .chainTypeManager()
-            .call()
-            .await?
-            .chainTypeManager;
-        ensure!(
-            chain_type_manager == bridgehub_info.stm_address,
-            "ValidatorTimelock chainTypeManager mismatch: expected {:?}, got {:?}",
-            bridgehub_info.stm_address,
-            chain_type_manager
+        let init_params = ValidatorTimelock::initializeCall {
+            _owner: config.owner_address,
+            _initialExecutionDelay: execution_delay,
+        }
+        .abi_encode();
+
+        result
+            .expect_create2_params_proxy_with_bytecode(
+                verifiers,
+                validator_timelock.address(),
+                init_params,
+                config.transparent_proxy_admin,
+                validator_timelock_constructor_params,
+                "l1-contracts/ValidatorTimelock",
+            )
+            .await;
+
+        Ok(())
+    }
+
+    async fn verify_chain_asset_handler(
+        &self,
+        config: &UpgradeOutput,
+        verifiers: &crate::verifiers::Verifiers,
+        result: &mut crate::verifiers::VerificationResult,
+        bridgehub_info: &BridgehubInfo,
+    ) -> Result<()> {
+        let chain_asset_handler_constructor_params = ChainAssetHandler::constructorCall::new((
+            U256::from(config.l1_chain_id),
+            config.owner_address,
+            bridgehub_info.bridgehub_addr,
+            bridgehub_info.l1_asset_router_proxy_addr,
+            config.deployed_addresses.bridgehub.message_root_proxy_addr,
+        ))
+        .abi_encode();
+        result.expect_create2_params(
+            verifiers,
+            &self.bridgehub.chain_asset_handler_implementation_addr,
+            chain_asset_handler_constructor_params.clone(),
+            "l1-contracts/ChainAssetHandler",
         );
+
+        let provider = verifiers.network_verifier.get_l1_provider();
+        let chain_asset_handler =
+            ChainAssetHandler::new(self.bridgehub.chain_asset_handler_proxy_addr, provider);
+        let current_owner = chain_asset_handler.owner().call().await?.owner;
+        ensure!(
+            current_owner == config.owner_address,
+            "Chain asset handler owner mismatch: expected {:?}, got {:?}",
+            config.owner_address,
+            current_owner
+        );
+
+        let init_params = ChainAssetHandler::initializeCall {
+            _owner: config.owner_address,
+        }
+        .abi_encode();
+
+        result
+            .expect_create2_params_proxy_with_bytecode(
+                verifiers,
+                chain_asset_handler.address(),
+                init_params,
+                config.transparent_proxy_admin,
+                chain_asset_handler_constructor_params,
+                "l1-contracts/ChainAssetHandler",
+            )
+            .await;
 
         Ok(())
     }
@@ -483,10 +591,10 @@ impl DeployedAddresses {
         let l1_asset_router =
             L1AssetRouter::new(bridgehub_info.l1_asset_router_proxy_addr, provider);
         let current_owner = l1_asset_router.owner().call().await?.owner;
-        if current_owner != config.protocol_upgrade_handler_proxy_address {
+        if current_owner != config.owner_address {
             result.report_error(&format!(
                 "L1AssetRouter owner mismatch: {} vs {}",
-                current_owner, config.protocol_upgrade_handler_proxy_address
+                current_owner, config.owner_address
             ));
         }
 
@@ -547,7 +655,7 @@ impl DeployedAddresses {
             &self.bridgehub.bridgehub_implementation_addr,
             BridgehubImpl::constructorCall::new((
                 U256::from(config.l1_chain_id),
-                config.protocol_upgrade_handler_proxy_address,
+                config.owner_address,
                 U256::from(MAX_NUMBER_OF_CHAINS),
             ))
             .abi_encode(),
@@ -791,6 +899,9 @@ impl DeployedAddresses {
         self.verify_validator_timelock(config, verifiers, result, &bridgehub_info)
             .await
             .context("validator timelock")?;
+        self.verify_chain_asset_handler(config, verifiers, result, &bridgehub_info)
+            .await
+            .context("chain asset handler")?;
         self.verify_l1_asset_router(config, verifiers, result, &bridgehub_info)
             .await
             .context("l1 asset")?;
@@ -854,7 +965,7 @@ impl DeployedAddresses {
             verifiers,
             &self.state_transition.default_upgrade_addr,
             Vec::new(),
-            "l1-contracts/DefaultUpgrade",
+            "l1-contracts/L1V29Upgrade",
         );
         result.expect_create2_params(
             verifiers,
@@ -866,7 +977,11 @@ impl DeployedAddresses {
         result.expect_create2_params(
             verifiers,
             &self.bridgehub.message_root_implementation_addr,
-            bridgehub_info.bridgehub_addr.abi_encode(),
+            MessageRoot::constructorCall::new((
+                bridgehub_info.bridgehub_addr,
+                U256::from(config.l1_chain_id),
+            ))
+            .abi_encode(),
             "l1-contracts/MessageRoot",
         );
 
@@ -922,7 +1037,7 @@ impl DeployedAddresses {
             verifiers,
             &config.gateway.gateway_state_transition.default_upgrade_addr,
             Vec::new(),
-            "l1-contracts/DefaultUpgrade",
+            "l1-contracts/L1V29Upgrade",
         );
         result.expect_create2_params(
             verifiers,
